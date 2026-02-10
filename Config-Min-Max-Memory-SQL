@@ -1,0 +1,80 @@
+#import below modules:
+#Install-Module -Name SqlServer -Scope CurrentUser -Force -AllowClobber
+#Import-Module SqlServer
+<#
+Sets SQL Server memory based on Windows physical RAM.
+- Min server memory = 20%
+- Max server memory = 80%
+- Reads RAM from Win32_ComputerSystem.TotalPhysicalMemory (bytes)
+- Converts to MB
+- Uses Invoke-Sqlcmd if available; falls back to .NET SqlClient if needed
+#>
+
+param(
+    [string]$SqlInstance = "localhost",   # e.g., "SERVERNAME", "SERVERNAME\INSTANCE"
+    [int]$MinPercent = 20,
+    [int]$MaxPercent = 80
+)
+
+# --- Get physical RAM (bytes) and convert to MB ---
+$cs = Get-CimInstance -ClassName Win32_ComputerSystem
+$totalMemMB = [math]::Floor($cs.TotalPhysicalMemory / 1MB)
+
+# --- Calculate target SQL Min/Max MB ---
+$minMemMB = [math]::Floor($totalMemMB * ($MinPercent / 100.0))
+$maxMemMB = [math]::Floor($totalMemMB * ($MaxPercent / 100.0))
+
+if ($minMemMB -gt $maxMemMB) {
+    throw "Min memory ($minMemMB MB) cannot be greater than max memory ($maxMemMB MB)."
+}
+
+Write-Host "Detected physical RAM: $totalMemMB MB"
+Write-Host "Setting SQL min server memory to: $minMemMB MB ($MinPercent%)"
+Write-Host "Setting SQL max server memory to: $maxMemMB MB ($MaxPercent%) on instance: $SqlInstance"
+
+# --- Run T-SQL to set min/max server memory ---
+$query = @"
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+
+EXEC sp_configure 'min server memory (MB)', $minMemMB;
+RECONFIGURE;
+
+EXEC sp_configure 'max server memory (MB)', $maxMemMB;
+RECONFIGURE;
+
+-- Verify
+EXEC sp_configure 'min server memory (MB)';
+EXEC sp_configure 'max server memory (MB)';
+"@
+
+# Guard against empty query (prevents parsing '' errors)
+if ([string]::IsNullOrWhiteSpace($query)) { throw "Query is empty." }
+
+# --- Try Invoke-Sqlcmd if SqlServer module is available ---
+try {
+    if (Get-Module -ListAvailable -Name SqlServer) {
+        Import-Module SqlServer -ErrorAction Stop
+        Invoke-Sqlcmd -ServerInstance $SqlInstance -Database master -Query $query -TrustServerCertificate -ErrorAction Stop
+        return
+    }
+}
+catch {
+    Write-Warning "Invoke-Sqlcmd failed or SqlServer module not usable. Falling back to SqlClient. Error: $($_.Exception.Message)"
+}
+
+# --- Fallback: .NET SqlClient (no SqlServer module required) ---
+$cn = New-Object System.Data.SqlClient.SqlConnection
+$cn.ConnectionString = "Server=$SqlInstance;Database=master;Integrated Security=True;Encrypt=True;TrustServerCertificate=True;"
+$cn.Open()
+
+$cmd = $cn.CreateCommand()
+$cmd.CommandText = $query
+
+$da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+$dt = New-Object System.Data.DataTable
+[void]$da.Fill($dt)
+
+$cn.Close()
+
+$dt | Format-Table -AutoSize
